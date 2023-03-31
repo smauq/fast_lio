@@ -1923,6 +1923,8 @@ public:
 				//{
 					P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
 				//}
+
+				std::cout << solve_time << " iters " << i << std::endl;
 				solve_time += omp_get_wtime() - solve_start;
 				return;
 			}

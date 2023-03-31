@@ -46,7 +46,6 @@
 #include "IMU_Processing.hpp"
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
-#include <visualization_msgs/Marker.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -59,6 +58,7 @@
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <maplab_msgs/OdometryWithImuBiases.h>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -138,6 +138,13 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+bool init = false;
+Eigen::Quaterniond grav_q;
+Eigen::Vector3d last_pos;
+ros::Time last_stamp;
+
+ros::Publisher maplab_pub;
 
 void SigHandle(int sig)
 {
@@ -294,6 +301,10 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+
+    if (scan_count % 10 == 0) {
+        std::cout << "Scans: " << scan_count << std::endl;
+    }
 }
 
 double timediff_lidar_wrt_imu = 0.0;
@@ -612,6 +623,72 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation( q );
     br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+
+    maplab_msgs::OdometryWithImuBiases msg;
+    msg.pose = odomAftMapped.pose;
+    msg.child_frame_id = "base";
+    msg.header.frame_id = "odom";
+    msg.header.stamp = odomAftMapped.header.stamp;
+    auto state = kf.get_x();
+
+    
+    // calculate angle between the two vectors
+    if (!init) {
+      std::cout<< "grav: " << state.grav << std::endl;
+      Eigen::Vector3d grav_e_n = state.grav;
+      grav_e_n.normalize();
+      Eigen::Vector3d grav;
+      grav << 0, 0, -1;
+      grav_q = Eigen::Quaterniond::FromTwoVectors(grav_e_n, grav);
+      grav_q.normalize();
+
+      double roll = - atan2(grav_e_n(1), -grav_e_n(2));
+      double pitch = atan2(grav_e_n(0),
+          sqrt(pow(grav_e_n(1),2) + pow(grav_e_n(2),2)));
+      ROS_WARN_STREAM("ROLL: " << roll * 180. / M_PI);
+      ROS_WARN_STREAM("PITCH: " << pitch *180. / M_PI);
+
+      grav_q = Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX())
+        * Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY())
+        * Eigen::AngleAxisd(0., Eigen::Vector3d::UnitZ());
+
+    }
+
+    auto grav_aligned = grav_q * state.grav;
+
+    const Eigen::Quaterniond r_m(geoQuat.w, geoQuat.x, geoQuat.y, geoQuat.z);
+    const Eigen::Quaterniond r_g = grav_q * r_m;
+    const Eigen::Vector3d p_g = grav_q * state.pos;
+
+    msg.pose.pose.position.x = p_g(0);
+    msg.pose.pose.position.y = p_g(1);
+    msg.pose.pose.position.z = p_g(2);
+    msg.pose.pose.orientation.x = r_g.x();
+    msg.pose.pose.orientation.y = r_g.y();
+    msg.pose.pose.orientation.z = r_g.z();
+    msg.pose.pose.orientation.w = r_g.w();
+    
+    msg.accel_bias.x = state.ba(0);
+    msg.accel_bias.y = state.ba(1);
+    msg.accel_bias.z = state.ba(2);
+    msg.gyro_bias.x = state.bg(0);
+    msg.gyro_bias.y = state.bg(1);
+    msg.gyro_bias.z = state.bg(2);
+
+    if (init) {
+      const double dt = (msg.header.stamp - last_stamp).toSec();
+      msg.twist.twist.linear.x = (msg.pose.pose.position.x - last_pos(0)) / dt;
+      msg.twist.twist.linear.y = (msg.pose.pose.position.y - last_pos(1)) / dt;
+      msg.twist.twist.linear.z = (msg.pose.pose.position.z - last_pos(2)) / dt;
+    }
+
+    maplab_pub.publish(msg);
+
+    last_pos(0) = msg.pose.pose.position.x;
+    last_pos(1) = msg.pose.pose.position.y;
+    last_pos(2) = msg.pose.pose.position.z;
+    last_stamp = msg.header.stamp;
+    init = true;
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -816,8 +893,8 @@ int main(int argc, char** argv)
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
-    double epsi[23] = {0.001};
-    fill(epsi, epsi+23, 0.001);
+    double epsi[23] = {1e-6};
+    fill(epsi, epsi+23, 1e-6);
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
@@ -851,6 +928,8 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    maplab_pub = nh.advertise<maplab_msgs::OdometryWithImuBiases>
+            ("/fastlio2/odom", 100000);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
